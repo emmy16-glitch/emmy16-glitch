@@ -1,0 +1,86 @@
+name: Prepare Ubuntu Server ISO release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/ubuntu-server-iso.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  download-split-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Download Ubuntu Server 24.04.5 LTS
+        shell: bash
+        run: |
+          set -euo pipefail
+          ISO="ubuntu-24.04.5-live-server-amd64.iso"
+          URL="https://releases.ubuntu.com/24.04/${ISO}"
+          curl --fail --location --retry 8 --retry-all-errors --retry-delay 15 \
+            --connect-timeout 30 --output "${ISO}" "${URL}"
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output SHA256SUMS.ubuntu.txt \
+            https://releases.ubuntu.com/24.04/SHA256SUMS
+          grep "${ISO}$" SHA256SUMS.ubuntu.txt > expected.sha256
+          test -s expected.sha256
+          sha256sum --check expected.sha256
+
+      - name: Split ISO into parts below GitHub's per-asset limit
+        shell: bash
+        run: |
+          set -euo pipefail
+          ISO="ubuntu-24.04.5-live-server-amd64.iso"
+          split --bytes=1400M --numeric-suffixes=0 --suffix-length=3 \
+            "${ISO}" "${ISO}.part-"
+          sha256sum "${ISO}".part-* > SHA256SUMS.parts
+          PARTS=( "${ISO}".part-* )
+          test "${#PARTS[@]}" -ge 2
+          {
+            echo "@echo off"
+            echo "cd /d \"%~dp0\""
+            printf "copy /b "
+            for i in "${!PARTS[@]}"; do
+              if [ "${i}" -gt 0 ]; then printf "+"; fi
+              printf "%s" "${PARTS[$i]}"
+            done
+            printf " \"%s\"\r\n" "${ISO}"
+            echo "if errorlevel 1 (echo Join failed.& pause & exit /b 1)"
+            echo "echo ISO assembled. Verify its SHA-256 against SHA256SUMS.ubuntu.txt."
+            echo "certutil -hashfile \"${ISO}\" SHA256"
+            echo "pause"
+          } > JOIN-UBUNTU-ISO.bat
+          cat > README-DOWNLOAD.txt <<'EOF'
+          Ubuntu Server 24.04.5 LTS — split ISO download
+
+          1. Download EVERY .part-000, .part-001, etc. asset into one folder.
+          2. Also download JOIN-UBUNTU-ISO.bat and SHA256SUMS.ubuntu.txt.
+          3. Keep every part name unchanged.
+          4. Double-click JOIN-UBUNTU-ISO.bat.
+          5. The batch file joins the parts into the original .iso.
+          6. Verify the displayed SHA-256 against the ubuntu-24.04.5-live-server-amd64.iso
+             entry in SHA256SUMS.ubuntu.txt before using the ISO.
+
+          The parts are sequential slices of the official Ubuntu ISO, not separate installers.
+          EOF
+
+      - name: Publish split files as GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="ubuntu-server-24.04.5-iso-20261121"
+          ISO="ubuntu-24.04.5-live-server-amd64.iso"
+          gh release create "${TAG}" \
+            "${ISO}".part-* \
+            SHA256SUMS.ubuntu.txt SHA256SUMS.parts \
+            JOIN-UBUNTU-ISO.bat README-DOWNLOAD.txt \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Ubuntu Server 24.04.5 LTS — Split ISO" \
+            --notes "Official Ubuntu Server 24.04.5 LTS AMD64 installer ISO, downloaded from releases.ubuntu.com and SHA-256 verified before splitting. Download all numbered .part files plus JOIN-UBUNTU-ISO.bat, then run the batch file on Windows. The parts are slices of one ISO; they must all be present and kept unchanged."
